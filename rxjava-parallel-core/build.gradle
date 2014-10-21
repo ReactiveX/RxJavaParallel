@@ -1,0 +1,20 @@
+apply plugin: 'maven'
+apply plugin: 'osgi'
+
+sourceCompatibility = JavaVersion.VERSION_1_6
+targetCompatibility = JavaVersion.VERSION_1_6
+
+dependencies {
+    testCompile 'junit:junit-dep:4.10'
+    testCompile 'org.mockito:mockito-core:1.8.5'
+}
+
+jar {
+    manifest {
+        name = 'rxjava-parallel'
+        instruction 'Bundle-Vendor', 'Netflix'
+        instruction 'Bundle-DocURL', 'https://github.com/Netflix/RxJavaParallel'
+        instruction 'Import-Package', '!org.junit,!junit.framework,!org.mockito.*,*'
+        instruction 'Eclipse-ExtensibleAPI', 'true'
+    }
+}
