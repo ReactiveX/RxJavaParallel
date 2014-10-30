@@ -1,2 +1,3 @@
 rootProject.name='rxjava-parallel'
 include 'rxjava-parallel'
+include 'rxjava-parallel-core'

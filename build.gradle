@@ -28,7 +28,7 @@ allprojects {
 subprojects {
     apply plugin: 'java'
     apply plugin: 'shadow'
-    group = "com.netflix.rxjava-parallel"
+    group = "com.netflix.rxjava-parallel-core"
 
     // everything defaults to 1.6
     sourceCompatibility = JavaVersion.VERSION_1_6
@@ -142,6 +142,6 @@ subprojects {
     shadowJar.dependsOn perfJar
 }
 
-project(':rxjava-parallel') {
+project(':rxjava-parallel-core') {
     sourceSets.test.java.srcDir 'src/test/java'
 }
