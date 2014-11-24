@@ -7,9 +7,7 @@ import rx.Subscription;
 import rx.exceptions.Exceptions;
 import rx.exceptions.OnErrorNotImplementedException;
 import rx.functions.Func1;
-import rx.internal.operators.OnSubscribeFromIterable;
-import rx.internal.operators.OnSubscribeRange;
-import rx.internal.operators.OperatorSubscribeOn;
+import rx.internal.operators.*;
 import rx.internal.util.ScalarSynchronousObservable;
 import rx.internal.util.SingleValueParallelObservable;
 import rx.observers.SafeSubscriber;
@@ -22,6 +20,7 @@ import rx.subscriptions.Subscriptions;
 import java.lang.Boolean;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 
 public class ParallelObservable<T> {
 
@@ -126,6 +125,32 @@ public class ParallelObservable<T> {
     }
 
     /**
+     * Converts an {@link Iterable} sequence into an Observable that operates on the specified Scheduler,
+     * emitting each item from the sequence.
+     * <p>
+     * <img width="640" height="315" src="https://raw.github.com/wiki/Netflix/RxJava/images/rx-operators/from.s.png" alt="">
+     * <dl>
+     *  <dt><b>Scheduler:</b></dt>
+     *  <dd>you specify which {@link Scheduler} this operator will use</dd>
+     * </dl>
+     *
+     * @param iterable
+     *            the source {@link Iterable} sequence
+     * @param scheduler
+     *            the Scheduler on which the Observable is to emit the items of the Iterable
+     * @param <T>
+     *            the type of items in the {@link Iterable} sequence and the type of items to be emitted by the
+     *            resulting Observable
+     * @return an Observable that emits each item in the source {@link Iterable} sequence, on the specified
+     *         Scheduler
+     * @see <a href="https://github.com/Netflix/RxJava/wiki/Creating-Observables#from">RxJava wiki: from</a>
+     * @see <a href="http://msdn.microsoft.com/en-us/library/hh212140.aspx">MSDN: Observable.ToObservable</a>
+     */
+    public final static <T> ParallelObservable<T> from(Iterable<? extends T> iterable, Scheduler scheduler) {
+        return from(iterable).subscribeOn(scheduler);
+    }
+
+    /**
      * Returns an Observable that emits a sequence of Integers within a specified range.
      * <p>
      * <img width="640" height="195" src="https://raw.github.com/wiki/Netflix/RxJava/images/rx-operators/range.png" alt="">
@@ -211,6 +236,36 @@ public class ParallelObservable<T> {
     }
 
     /**
+     * Returns an Observable that emits a single item, a list composed of all the items emitted by the source
+     * Observable.
+     * <p>
+     * <img width="640" height="305" src="https://raw.github.com/wiki/Netflix/RxJava/images/rx-operators/toList.png" alt="">
+     * <p>
+     * Normally, an Observable that returns multiple items will do so by invoking its {@link Observer}'s
+     * {@link Observer#onNext onNext} method for each such item. You can change this behavior, instructing the
+     * Observable to compose a list of all of these items and then to invoke the Observer's {@code onNext}
+     * function once, passing it the entire list, by calling the Observable's {@code toList} method prior to
+     * calling its {@link #subscribe} method.
+     * <p>
+     * Be careful not to use this operator on Observables that emit infinite or very large numbers of items, as
+     * you do not have the option to unsubscribe.
+     * <dl>
+     *  <dt><b>Backpressure Support:</b></dt>
+     *  <dd>This operator does not support backpressure as by intent it is requesting and buffering everything.</dd>
+     *  <dt><b>Scheduler:</b></dt>
+     *  <dd>{@code toList} does not operate by default on a particular {@link Scheduler}.</dd>
+     * </dl>
+     *
+     * @return an Observable that emits a single item: a List containing all of the items emitted by the source
+     *         Observable
+     * @see <a href="https://github.com/Netflix/RxJava/wiki/Mathematical-and-Aggregate-Operators#tolist">RxJava wiki: toList</a>
+     * @see <a href="http://msdn.microsoft.com/en-us/library/hh211848.aspx">MSDN: Observable.ToList</a>
+     */
+    public final ParallelObservable<List<T>> toList() {
+        return lift(new OperatorToObservableList<T>());
+    }
+
+    /**
      * Flattens two Observables into a single Observable, without any transformation.
      * <p>
      * <img width="640" height="380" src="https://raw.github.com/wiki/Netflix/RxJava/images/rx-operators/merge.png" alt="">
@@ -255,7 +310,7 @@ public class ParallelObservable<T> {
      * @see <a href="http://msdn.microsoft.com/en-us/library/hh229590.aspx">MSDN: Observable.Merge</a>
      */
     public static <T> ParallelObservable<T> merge(Iterable<? extends ParallelObservable<? extends T>> observables){
-        return null;
+        return merge(from(observables));
     }
 
     /**
@@ -283,7 +338,7 @@ public class ParallelObservable<T> {
      * @see <a href="http://msdn.microsoft.com/en-us/library/hh229923.aspx">MSDN: Observable.Merge</a>
      */
     public static <T> ParallelObservable<T> merge(Iterable<? extends ParallelObservable<? extends T>> observables, int maxConcurrent){
-        return null;
+        return merge(from(observables), maxConcurrent);
     }
 
     /**
@@ -314,7 +369,7 @@ public class ParallelObservable<T> {
      * @see <a href="http://msdn.microsoft.com/en-us/library/hh244329.aspx">MSDN: Observable.Merge</a>
      */
     public static <T> ParallelObservable<T> merge(Iterable<? extends ParallelObservable<? extends T>> observables, int maxConcurrent, Scheduler scheduler){
-        return null;
+        return merge(from(observables, scheduler), maxConcurrent);
     }
 
     /**
@@ -340,7 +395,7 @@ public class ParallelObservable<T> {
      * @see <a href="http://msdn.microsoft.com/en-us/library/hh244336.aspx">MSDN: Observable.Merge</a>
      */
     public static <T> ParallelObservable<T> merge(Iterable<? extends ParallelObservable<? extends T>> observables, Scheduler scheduler){
-        return null;
+        return merge(from(observables, scheduler));
     }
 
     /**
@@ -364,7 +419,7 @@ public class ParallelObservable<T> {
      * @see <a href="http://msdn.microsoft.com/en-us/library/hh229099.aspx">MSDN: Observable.Merge</a>
      */
     public static <T> ParallelObservable<T> merge(ParallelObservable<? extends ParallelObservable<? extends T>> source){
-        return null;
+        return source.lift(new OperatorParallelMerge<T>());
     }
 
     /**
@@ -393,7 +448,7 @@ public class ParallelObservable<T> {
      * @see <a href="http://msdn.microsoft.com/en-us/library/hh211914.aspx">MSDN: Observable.Merge</a>
      */
     public static <T> ParallelObservable<T> merge(ParallelObservable<? extends ParallelObservable<? extends T>> source, int maxConcurrent){
-        return null;
+        return source.lift(new OperatorParallelMergeMaxConcurrent<T>(maxConcurrent));
     }
 
     /**
@@ -414,7 +469,7 @@ public class ParallelObservable<T> {
      * @see <a href="http://msdn.microsoft.com/en-us/library/hh244306.aspx">MSDN: Observable.Select</a>
      */
     public final <R> ParallelObservable<R> map(Func1<? super T, ? extends R> func) {
-        return null;
+        return lift(new OperatorParallelMap<T, R>(func));
     }
 
     /**

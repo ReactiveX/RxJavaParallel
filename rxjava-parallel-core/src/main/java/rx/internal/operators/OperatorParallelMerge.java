@@ -15,7 +15,9 @@ import rx.internal.util.SubscriptionIndexedRingBuffer;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
+import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 
 /**
  * Flattens a list of {@link Observable}s into one {@code Observable}, without any transformation.
@@ -54,12 +56,10 @@ public class OperatorParallelMerge<T> implements Observable.Operator<T, Parallel
         private ConcurrentLinkedQueue<Throwable> exceptions;
 
         private volatile SubscriptionIndexedRingBuffer<InnerSubscriber<T>> childrenSubscribers;
+        private final static AtomicReferenceFieldUpdater<MergeSubscriber, SubscriptionIndexedRingBuffer> CHILDREN_SUBSCRIBERS = AtomicReferenceFieldUpdater.newUpdater(MergeSubscriber.class, SubscriptionIndexedRingBuffer.class, "childrenSubscribers");
 
         private RxRingBuffer scalarValueQueue = null;
-
-        /* protected by lock on MergeSubscriber instance */
-        private int missedEmitting = 0;
-        private boolean emitLock = false;
+        private AtomicLong missedEmitting = new AtomicLong(0L);
 
         /**
          * Using synchronized(this) for `emitLock` instead of ReentrantLock or AtomicInteger is faster when there is no contention.
@@ -115,8 +115,9 @@ public class OperatorParallelMerge<T> implements Observable.Operator<T, Parallel
         private void handleNewSource(ParallelObservable<? extends T> t) {
             if (childrenSubscribers == null) {
                 // lazily create this only if we receive Observables we need to subscribe to
-                childrenSubscribers = new SubscriptionIndexedRingBuffer<InnerSubscriber<T>>();
-                add(childrenSubscribers);
+                if(CHILDREN_SUBSCRIBERS.compareAndSet(this, null, new SubscriptionIndexedRingBuffer<InnerSubscriber<T>>())) {
+                    add(childrenSubscribers);
+                }
             }
             MergeProducer<T> producerIfNeeded = null;
             // if we have received a request then we need to respect it, otherwise we fast-path
@@ -170,54 +171,45 @@ public class OperatorParallelMerge<T> implements Observable.Operator<T, Parallel
 
         private void handleScalarSynchronousObservableWithoutRequestLimits(SingleValueParallelObservable<? extends T> t) {
             T value = t.get();
-            if (getEmitLock()) {
-                try {
-                    actual.onNext(value);
-                    return;
-                } finally {
-                    if (releaseEmitLock()) {
-                        drainQueuesIfNeeded();
-                    }
-                    request(1);
-                }
-            } else {
-                initScalarValueQueueIfNeeded();
-                try {
-                    scalarValueQueue.onNext(value);
-                } catch (MissingBackpressureException e) {
-                    onError(e);
-                }
+            try {
+                actual.onNext(value);
                 return;
+            } finally {
+                drainQueuesIfNeeded();
+                request(1);
             }
         }
 
         private void handleScalarSynchronousObservableWithRequestLimits(SingleValueParallelObservable<? extends T> t) {
-            if (getEmitLock()) {
-                boolean emitted = false;
-                try {
-                    long r = mergeProducer.requested;
-                    if (r > 0) {
-                        emitted = true;
-                        actual.onNext(t.get());
-                        MergeProducer.REQUESTED.decrementAndGet(mergeProducer);
-                        // we handle this Observable without ever incrementing the wip or touching other machinery so just return here
-                        return;
-                    }
-                } finally {
-                    if (releaseEmitLock()) {
-                        drainQueuesIfNeeded();
-                    }
-                    if (emitted) {
-                        request(1);
-                    }
+
+            boolean emitted = false;
+            try {
+                //Assume we can proceed by decrementing requested.  If we're wrong, "put it back" in the else block.
+                if (MergeProducer.REQUESTED.decrementAndGet(mergeProducer) >= 0) {
+                    emitted = true;
+                    actual.onNext(t.get());
+
+                    // we handle this Observable without ever incrementing the wip or touching other machinery so just return here
+                    return;
+                } else {
+                    MergeProducer.REQUESTED.incrementAndGet(mergeProducer);
+                }
+
+            } finally {
+                drainQueuesIfNeeded();
+
+                if (emitted) {
+                    request(1);
                 }
             }
 
             // if we didn't return above we need to enqueue
             // enqueue the values for later delivery
+            //TODO: This is the only place we actually use the scalarValueQueue - can we get rid of it entirely?
             initScalarValueQueueIfNeeded();
             try {
                 scalarValueQueue.onNext(t.get());
+                missedEmitting.incrementAndGet();
             } catch (MissingBackpressureException e) {
                 onError(e);
             }
@@ -230,44 +222,40 @@ public class OperatorParallelMerge<T> implements Observable.Operator<T, Parallel
             }
         }
 
-        private synchronized boolean releaseEmitLock() {
-            emitLock = false;
-            if (missedEmitting == 0) {
-                return false;
-            } else {
-                return true;
-            }
-        }
-
-        private synchronized boolean getEmitLock() {
-            if (emitLock) {
-                missedEmitting++;
-                return false;
-            } else {
-                emitLock = true;
-                missedEmitting = 0;
-                return true;
-            }
-        }
+//        private synchronized boolean releaseEmitLock() {
+//            emitLock = false;
+//            if (missedEmitting == 0) {
+//                return false;
+//            } else {
+//                return true;
+//            }
+//        }
+//
+//        private synchronized boolean getEmitLock() {
+//            if (emitLock) {
+//                missedEmitting++;
+//                return false;
+//            } else {
+//                emitLock = true;
+//                missedEmitting = 0;
+//                return true;
+//            }
+//        }
 
         private boolean drainQueuesIfNeeded() {
             while (true) {
-                if (getEmitLock()) {
-                    int emitted = 0;
-                    try {
-                        emitted = drainScalarValueQueue();
-                        drainChildrenQueues();
-                    } finally {
-                        boolean moreToDrain = releaseEmitLock();
-                        // request outside of lock
-                        request(emitted);
-                        if (!moreToDrain) {
-                            return true;
-                        }
-                        // otherwise we'll loop and get whatever was added
+                int emitted = 0;
+                try {
+                    emitted = drainScalarValueQueue();
+                    drainChildrenQueues();
+                } finally {
+                    boolean moreToDrain = missedEmitting.get() > 0;
+                    // request outside of lock
+                    request(emitted);
+                    if (!moreToDrain) {
+                        return true;
                     }
-                } else {
-                    return false;
+                    // otherwise we'll loop and get whatever was added
                 }
             }
         }
@@ -312,6 +300,7 @@ public class OperatorParallelMerge<T> implements Observable.Operator<T, Parallel
                     // decrement the number we emitted from outstanding requests
                     MergeProducer.REQUESTED.getAndAdd(mergeProducer, -emittedWhileDraining);
                 }
+                missedEmitting.addAndGet(-emittedWhileDraining);
                 return emittedWhileDraining;
             }
             return 0;
@@ -538,75 +527,72 @@ public class OperatorParallelMerge<T> implements Observable.Operator<T, Parallel
              * It looks like it may cause a slowdown in highly contended cases (like 'mergeTwoAsyncStreamsOfN' above) as instead of just
              * putting in the queue, it attempts to get the lock. We are optimizing for the non-contended case.
              */
-            if (parentSubscriber.getEmitLock()) {
-                enqueue = false;
-                try {
-                    // drain the queue if there is anything in it before emitting the current value
-                    emitted += drainQueue();
-                    //                    }
-                    if (producer == null) {
-                        // no backpressure requested
-                        if (complete) {
-                            parentSubscriber.completeInner(this);
-                        } else {
-                            try {
-                                parentSubscriber.actual.onNext(t);
-                            } catch (Throwable e) {
-                                // special error handling due to complexity of merge
-                                onError(OnErrorThrowable.addValueAsLastCause(e, t));
-                            }
-                            emitted++;
-                        }
-                    } else {
-                        // this needs to check q.count() as draining above may not have drained the full queue
-                        // perf tests show this to be okay, though different queue implementations could perform poorly with this
-                        if (producer.requested > 0 && q.count() == 0) {
-                            if (complete) {
-                                parentSubscriber.completeInner(this);
-                            } else {
-                                try {
-                                    parentSubscriber.actual.onNext(t);
-                                } catch (Throwable e) {
-                                    // special error handling due to complexity of merge
-                                    onError(OnErrorThrowable.addValueAsLastCause(e, t));
-                                }
-                                emitted++;
-                                MergeProducer.REQUESTED.decrementAndGet(producer);
-                            }
-                        } else {
-                            // no requests available, so enqueue it
-                            enqueue = true;
-                        }
+            enqueue = false;
+
+            // drain the queue if there is anything in it before emitting the current value
+            emitted += drainQueue();
+            //                    }
+            if (producer == null) {
+                // no backpressure requested
+                if (complete) {
+                    parentSubscriber.completeInner(this);
+                } else {
+                    try {
+                        parentSubscriber.actual.onNext(t);
+                    } catch (Throwable e) {
+                        // special error handling due to complexity of merge
+                        onError(OnErrorThrowable.addValueAsLastCause(e, t));
                     }
-                } finally {
-                    drain = parentSubscriber.releaseEmitLock();
+                    emitted++;
                 }
-                if (emitted > THRESHOLD) {
-                    // this is for batching requests when we're in a use case that isn't queueing, always fast-pathing the onNext
-                    /**
-                     * <pre> {@code
-                     * Without this batching:
-                     *
-                     * Benchmark                                          (size)   Mode   Samples        Score  Score error    Units
-                     * r.o.OperatorMergePerf.merge1SyncStreamOfN               1  thrpt         5  5060743.715   100445.513    ops/s
-                     * r.o.OperatorMergePerf.merge1SyncStreamOfN            1000  thrpt         5    36606.582     1610.582    ops/s
-                     * r.o.OperatorMergePerf.merge1SyncStreamOfN         1000000  thrpt         5       38.476        0.973    ops/s
-                     *
-                     * With this batching:
-                     *
-                     * Benchmark                                          (size)   Mode   Samples        Score  Score error    Units
-                     * r.o.OperatorMergePerf.merge1SyncStreamOfN               1  thrpt         5  5367945.738   262740.137    ops/s
-                     * r.o.OperatorMergePerf.merge1SyncStreamOfN            1000  thrpt         5    62703.930     8496.036    ops/s
-                     * r.o.OperatorMergePerf.merge1SyncStreamOfN         1000000  thrpt         5       72.711        3.746    ops/s
-                     *} </pre>
-                     */
-                    request(emitted);
-                    // we are modifying this outside of the emit lock ... but this can be considered a "lazySet"
-                    // and it will be flushed before anything else touches it because the emitLock will be obtained
-                    // before any other usage of it
-                    emitted = 0;
+            } else {
+                // this needs to check q.count() as draining above may not have drained the full queue
+                // perf tests show this to be okay, though different queue implementations could perform poorly with this
+                if (producer.requested > 0 && q.count() == 0) {
+                    if (complete) {
+                        parentSubscriber.completeInner(this);
+                    } else {
+                        try {
+                            parentSubscriber.actual.onNext(t);
+                        } catch (Throwable e) {
+                            // special error handling due to complexity of merge
+                            onError(OnErrorThrowable.addValueAsLastCause(e, t));
+                        }
+                        emitted++;
+                        MergeProducer.REQUESTED.decrementAndGet(producer);
+                    }
+                } else {
+                    // no requests available, so enqueue it
+                    enqueue = true;
                 }
             }
+
+            if (emitted > THRESHOLD) {
+                // this is for batching requests when we're in a use case that isn't queueing, always fast-pathing the onNext
+                /**
+                 * <pre> {@code
+                 * Without this batching:
+                 *
+                 * Benchmark                                          (size)   Mode   Samples        Score  Score error    Units
+                 * r.o.OperatorMergePerf.merge1SyncStreamOfN               1  thrpt         5  5060743.715   100445.513    ops/s
+                 * r.o.OperatorMergePerf.merge1SyncStreamOfN            1000  thrpt         5    36606.582     1610.582    ops/s
+                 * r.o.OperatorMergePerf.merge1SyncStreamOfN         1000000  thrpt         5       38.476        0.973    ops/s
+                 *
+                 * With this batching:
+                 *
+                 * Benchmark                                          (size)   Mode   Samples        Score  Score error    Units
+                 * r.o.OperatorMergePerf.merge1SyncStreamOfN               1  thrpt         5  5367945.738   262740.137    ops/s
+                 * r.o.OperatorMergePerf.merge1SyncStreamOfN            1000  thrpt         5    62703.930     8496.036    ops/s
+                 * r.o.OperatorMergePerf.merge1SyncStreamOfN         1000000  thrpt         5       72.711        3.746    ops/s
+                 *} </pre>
+                 */
+                request(emitted);
+                // we are modifying this outside of the emit lock ... but this can be considered a "lazySet"
+                // and it will be flushed before anything else touches it because the emitLock will be obtained
+                // before any other usage of it
+                emitted = 0;
+            }
+
             if (enqueue) {
                 enqueue(t, complete);
                 drain = true;
